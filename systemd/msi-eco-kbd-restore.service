@@ -1,0 +1,14 @@
+[Unit]
+Description=Restore MSI keyboard backlight on lid open while retaining hardware eco
+After=systemd-modules-load.service
+ConditionPathExists=/sys/devices/platform/msi-ec/shift_mode
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/modprobe ec_sys write_support=1
+ExecStart=/usr/local/libexec/msi-eco-kbd-restore
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

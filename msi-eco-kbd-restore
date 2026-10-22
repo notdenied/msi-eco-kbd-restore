@@ -1,0 +1,103 @@
+#!/usr/bin/python3
+"""Model/BIOS-specific lid-open workaround. Does not set CPU power limits."""
+import argparse
+import glob
+import logging
+import os
+from pathlib import Path
+import select
+import struct
+import time
+
+BASE = Path('/sys/devices/platform/msi-ec')
+EC = '/sys/kernel/debug/ec/ec0/io'
+EVENT = struct.Struct('@llHHi')
+
+def read(path):
+    return Path(path).read_text().strip()
+
+def guard():
+    if read('/sys/class/dmi/id/product_name') != 'Vector 16 HX AI A2XWIG' or read('/sys/class/dmi/id/bios_version') != 'E15M3IMS.116':
+        raise RuntimeError('Unsupported model/BIOS; workaround disabled')
+
+def lid_open():
+    states = glob.glob('/proc/acpi/button/lid/*/state')
+    return bool(states) and all(read(p).endswith('open') for p in states)
+
+def restore():
+    guard()
+    if not lid_open() or read(BASE/'shift_mode') != 'eco':
+        return
+    fd = os.open(EC, os.O_RDWR)
+    switched = False
+    try:
+        mode = os.pread(fd, 1, 0xd2)
+        flags = os.pread(fd, 1, 0xeb)
+        if mode != b'\xc2' or len(flags) != 1 or (flags[0] & 0x0f) != 0x0f:
+            logging.info('Skipping: eco/Super Battery state changed')
+            return
+        (BASE/'shift_mode').write_text('comfort\n')
+        switched = True
+        time.sleep(1)
+        if read(BASE/'shift_mode') != 'comfort':
+            switched = False
+            logging.info('Mode changed externally; leaving it untouched')
+            return
+        # Eco entry only queues backlight-off if EB[6:0] is zero.
+        # Restore the saved Super Battery flags BEFORE requesting eco.
+        os.pwrite(fd, flags, 0xeb)
+        (BASE/'shift_mode').write_text('eco\n')
+        switched = False
+        time.sleep(.2)
+        logging.info('Restored backlight; mode=%s SuperBattery=%s EC[D2]=%s EC[EB]=%s',
+                     read(BASE/'shift_mode'), read(BASE/'super_battery'),
+                     os.pread(fd,1,0xd2).hex(), os.pread(fd,1,0xeb).hex())
+    finally:
+        if switched and read(BASE/'shift_mode') == 'comfort':
+            (BASE/'shift_mode').write_text('eco\n')
+        os.close(fd)
+
+def watch():
+    guard()
+    paths = [p for p in glob.glob('/sys/class/input/event*')
+             if read(Path(p)/'device/name') == 'Lid Switch']
+    if len(paths) != 1:
+        raise RuntimeError('Expected exactly one Lid Switch input device')
+    fd = os.open('/dev/input/'+Path(paths[0]).name, os.O_RDONLY | os.O_NONBLOCK)
+    logging.info('Watching lid events; active only in eco/Super Battery')
+    previous_open = lid_open()
+    try:
+        while True:
+            ready, _, _ = select.select([fd], [], [], 2)
+            opened = False
+            if ready:
+                data = os.read(fd, EVENT.size * 64)
+                if not data:
+                    raise RuntimeError('Lid device disconnected')
+                for offset in range(0, len(data), EVENT.size):
+                    _, _, typ, code, value = EVENT.unpack_from(data, offset)
+                    if typ == 5 and code == 0:  # EV_SW / SW_LID
+                        opened |= value == 0
+            now_open = lid_open()
+            if now_open and (opened or not previous_open):
+                try:
+                    restore()
+                except Exception:
+                    logging.exception('Restore failed')
+            previous_open = now_open
+    finally:
+        os.close(fd)
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--once', action='store_true')
+    parser.add_argument('--check', action='store_true')
+    args = parser.parse_args()
+    if args.check:
+        guard()
+        print('Supported model/BIOS; mode='+read(BASE/'shift_mode'))
+    elif args.once:
+        restore()
+    else:
+        watch()
